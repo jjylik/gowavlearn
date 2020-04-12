@@ -1,9 +1,13 @@
 package main
 
 import (
+	"encoding/csv"
 	"fmt"
+	"math"
 	"math/rand"
+	"os"
 
+	"github.com/go-audio/wav"
 	"github.com/sjwhitworth/golearn/base"
 	"github.com/sjwhitworth/golearn/ensemble"
 	"github.com/sjwhitworth/golearn/evaluation"
@@ -11,15 +15,111 @@ import (
 	"github.com/sjwhitworth/golearn/trees"
 )
 
+const wavFile = "./Recorder_Flute_SI.wav"
+
+const chunks = 10
+
+type wavstats struct {
+	AveragePitch []string
+	Length       int64
+	Rms          []string
+}
+
 func main() {
-	err := avgPitch()
-	//err := avgPitch()
+	err := splitWav()
 	if err != nil {
 		fmt.Println(err)
 	}
 }
 
-func tree_classify() {
+func createHeader() []string {
+	var header = []string{"Length"}
+	for i := 0; i < chunks; i++ {
+		header = append(header, fmt.Sprintf("Pitch_%d", i))
+	}
+	for i := 0; i < chunks; i++ {
+		header = append(header, fmt.Sprintf("RMS_%d", i))
+	}
+	header = append(header, "Type")
+	return header
+}
+
+func splitWav() error {
+	f, err := os.Open(wavFile)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	d := wav.NewDecoder(f)
+	stats, _ := extractFeatures(d)
+	output, err := os.Create("result.csv")
+	writer := csv.NewWriter(output)
+	defer writer.Flush()
+	writer.Write(createHeader())
+	//	for i := 0; i < 1; i++ {
+	line := []string{fmt.Sprintf("%d", stats.Length)}
+	line = append(line, stats.AveragePitch...)
+	line = append(line, stats.Rms...)
+	line = append(line, "Drums")
+	writer.Write(line)
+	//}
+	defer output.Close()
+	writer.Flush()
+	return nil
+}
+
+func normalize(val, min, max int64) float32 {
+	return float32(val-min)/float32(max-min)*(1+1) - 1
+}
+
+func extractFeatures(d *wav.Decoder) (stats wavstats, err error) {
+	length, _ := d.Duration()
+	chunkLength := length / chunks
+	d.Seek(0, 0)
+	chunkBufferLength := int(chunkLength.Seconds() * 44100)
+	fullWavBuffer, err := d.FullPCMBuffer()
+	chunkBuffer := make([]float32, chunkBufferLength)
+	j := 0
+	stats.Length = length.Milliseconds()
+	for _, s := range fullWavBuffer.Data {
+		var normalized float32
+		if d.BitDepth == 16 {
+			raw := int64(int32(int16(s)))
+			normalized = normalize(raw, -32768, 32767)
+			fmt.Println(normalized)
+		} else if d.BitDepth == 24 {
+			raw := int64(int32(s))
+			normalized = normalize(raw, -8388608, 8388607)
+		}
+		chunkBuffer[j] = normalized
+		if j == chunkBufferLength-1 {
+			frequency, probability := findMainFrequency(chunkBuffer, chunkBufferLength)
+			rms := rootMeanSquare(chunkBuffer)
+			fmt.Println(rms)
+			fmt.Printf("Main Frequency: %f - Probability: %f \n", frequency, probability)
+			stats.AveragePitch = append(stats.AveragePitch, fmt.Sprintf("%f", frequency))
+			stats.Rms = append(stats.Rms, fmt.Sprintf("%f", rms))
+			chunkBuffer = make([]float32, chunkBufferLength)
+			j = 0
+		}
+		j++
+	}
+	if err == nil {
+		err = d.Err()
+	}
+	return stats, err
+}
+
+func rootMeanSquare(data []float32) float64 {
+	sum := 0.
+	n := float64(len(data))
+	for _, x := range data {
+		sum += float64(x * x)
+	}
+	return math.Sqrt(sum / n)
+}
+
+func treeClassify() {
 	var tree base.Classifier
 
 	rand.Seed(44111342)
