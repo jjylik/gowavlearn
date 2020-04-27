@@ -15,21 +15,19 @@
 //
 package main
 
-func findMainFrequency(buff []float32, bufferSize int) (frequency float64, probability float64) {
+func findMainFrequency(buff []float32, bufferSize, samplingRate int) (frequency float64, probability float64) {
 	//arr :=  [YIN_SAMPLING_RATE / 2]float64{}
 	//yin := Yin{0,0, arr, 0.0, 0.0}
 	yin := Yin{}
 	//bufferSize := 44100
 	threashold := 0.05
 	yin.YinInit(bufferSize, threashold)
-	frequency = yin.YinGetPitch(buff)
+	frequency = yin.YinGetPitch(buff, samplingRate)
 	probability = yin.YinGetProbability()
 	return frequency, probability
 }
 
 //################################################################
-
-const YIN_SAMPLING_RATE int = 44100
 
 type Yin struct {
 	bufferSize     int       // Size of the buffer to process.
@@ -54,7 +52,7 @@ func (Y *Yin) YinInit(bufferSize int, threshold float64) {
 // Runs the Yin pitch detection algortihm
 //        buffer       - Buffer of samples to analyse
 // return pitchInHertz - Fundamental frequency of the signal in Hz. Returns -1 if pitch can't be found
-func (Y *Yin) YinGetPitch(buffer []float32) (pitchInHertz float64) {
+func (Y *Yin) YinGetPitch(buffer []float32, samplingRate int) (pitchInHertz float64) {
 	//tauEstimate int      := -1
 	pitchInHertz = -1
 
@@ -69,7 +67,7 @@ func (Y *Yin) YinGetPitch(buffer []float32) (pitchInHertz float64) {
 
 	// Step 5: Interpolate the shift value (tau) to improve the pitch estimate.
 	if tauEstimate != -1 {
-		pitchInHertz = float64(YIN_SAMPLING_RATE) / Y.yinParabolicInterpolation(tauEstimate)
+		pitchInHertz = float64(samplingRate) / Y.yinParabolicInterpolation(tauEstimate)
 	}
 
 	return pitchInHertz

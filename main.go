@@ -2,20 +2,17 @@ package main
 
 import (
 	"encoding/csv"
+	"flag"
 	"fmt"
+	"io/ioutil"
+	"log"
 	"math"
-	"math/rand"
 	"os"
+	"path/filepath"
+	"regexp"
 
 	"github.com/go-audio/wav"
-	"github.com/sjwhitworth/golearn/base"
-	"github.com/sjwhitworth/golearn/ensemble"
-	"github.com/sjwhitworth/golearn/evaluation"
-	"github.com/sjwhitworth/golearn/filters"
-	"github.com/sjwhitworth/golearn/trees"
 )
-
-const wavFile = "./Recorder_Flute_SI.wav"
 
 const chunks = 10
 
@@ -25,11 +22,51 @@ type wavstats struct {
 	Rms          []string
 }
 
+var resultFile string
+var game string
+var imageDir string
+
+func init() {
+	flag.StringVar(&resultFile, "resultfile", "", "Classify data set source")
+	flag.Parse()
+}
+
 func main() {
-	err := splitWav()
-	if err != nil {
-		fmt.Println(err)
+	log.Println(resultFile)
+	if resultFile != "" {
+		treeClassify(resultFile)
+	} else {
+		extractAllWavFeaturesToCsv()
 	}
+
+}
+func extractAllWavFeaturesToCsv() {
+	finished := make(chan bool)
+	resultChan := make(chan []string, 10)
+	numberOfFilesRead := 0
+	numberOfFilesRead += readFilesInFolder("./data/kick", "Kick", resultChan)
+	numberOfFilesRead += readFilesInFolder("./data/hat", "Hat", resultChan)
+	numberOfFilesRead += readFilesInFolder("./data/other", "Other", resultChan)
+	numberOfFilesRead += readFilesInFolder("./data/percussion", "Percussion", resultChan)
+	numberOfFilesRead += readFilesInFolder("./data/snare", "Kick", resultChan)
+	go writeResultCsv(resultChan, finished, numberOfFilesRead)
+	<-finished
+}
+
+func readFilesInFolder(path, instrument string, resultChan chan []string) int {
+	files, err := ioutil.ReadDir(path)
+	if err != nil {
+		log.Fatal(err)
+	}
+	pattern := regexp.MustCompile(`.*\.wav`)
+	expecting := 0
+	for _, file := range files {
+		if pattern.MatchString(file.Name()) {
+			expecting++
+			go processWav(filepath.Join(path, file.Name()), instrument, resultChan)
+		}
+	}
+	return expecting
 }
 
 func createHeader() []string {
@@ -44,28 +81,40 @@ func createHeader() []string {
 	return header
 }
 
-func splitWav() error {
-	f, err := os.Open(wavFile)
+func writeResultCsv(resultChannel chan []string, finished chan<- bool, expecting int) {
+	output, _ := os.Create("result.csv")
+	writer := csv.NewWriter(output)
+	writer.Write(createHeader())
+	i := 0
+	for line := range resultChannel {
+		writer.Write(line)
+		if i >= expecting {
+			close(resultChannel)
+		}
+		i++
+	}
+	writer.Flush()
+	output.Close()
+	finished <- true
+}
+
+func processWav(file, instrument string, resultChannel chan<- []string) {
+	f, err := os.Open(file)
 	if err != nil {
-		return err
+		log.Fatal(err)
 	}
 	defer f.Close()
 	d := wav.NewDecoder(f)
-	stats, _ := extractFeatures(d)
-	output, err := os.Create("result.csv")
-	writer := csv.NewWriter(output)
-	defer writer.Flush()
-	writer.Write(createHeader())
-	//	for i := 0; i < 1; i++ {
+	stats, err := extractFeatures(d)
+	if err != nil {
+		return
+	}
 	line := []string{fmt.Sprintf("%d", stats.Length)}
 	line = append(line, stats.AveragePitch...)
 	line = append(line, stats.Rms...)
-	line = append(line, "Drums")
-	writer.Write(line)
-	//}
-	defer output.Close()
-	writer.Flush()
-	return nil
+	line = append(line, instrument)
+	resultChannel <- line
+	log.Println("Processed ", file)
 }
 
 func normalize(val, min, max int64) float32 {
@@ -76,27 +125,27 @@ func extractFeatures(d *wav.Decoder) (stats wavstats, err error) {
 	length, _ := d.Duration()
 	chunkLength := length / chunks
 	d.Seek(0, 0)
-	chunkBufferLength := int(chunkLength.Seconds() * 44100)
 	fullWavBuffer, err := d.FullPCMBuffer()
+	sampleRate := int(d.Format().SampleRate)
+	chunkBufferLength := int(chunkLength.Seconds() * float64(sampleRate))
 	chunkBuffer := make([]float32, chunkBufferLength)
-	j := 0
 	stats.Length = length.Milliseconds()
-	for _, s := range fullWavBuffer.Data {
-		var normalized float32
-		if d.BitDepth == 16 {
-			raw := int64(int32(int16(s)))
-			normalized = normalize(raw, -32768, 32767)
-			fmt.Println(normalized)
-		} else if d.BitDepth == 24 {
-			raw := int64(int32(s))
-			normalized = normalize(raw, -8388608, 8388607)
+	j := 0
+	if d.NumChans > 2 {
+		return stats, fmt.Errorf("too many chans")
+	}
+	for i := 0; i < len(fullWavBuffer.Data); i += int(d.NumChans) {
+		var pcmValue int
+		if d.NumChans == 2 {
+			pcmValue = (fullWavBuffer.Data[i] + fullWavBuffer.Data[i+1]) / 2
+		} else {
+			pcmValue = fullWavBuffer.Data[i]
 		}
+		normalized := getNormalizedPcm(d.BitDepth, pcmValue)
 		chunkBuffer[j] = normalized
 		if j == chunkBufferLength-1 {
-			frequency, probability := findMainFrequency(chunkBuffer, chunkBufferLength)
+			frequency, _ := findMainFrequency(chunkBuffer, chunkBufferLength, sampleRate)
 			rms := rootMeanSquare(chunkBuffer)
-			fmt.Println(rms)
-			fmt.Printf("Main Frequency: %f - Probability: %f \n", frequency, probability)
 			stats.AveragePitch = append(stats.AveragePitch, fmt.Sprintf("%f", frequency))
 			stats.Rms = append(stats.Rms, fmt.Sprintf("%f", rms))
 			chunkBuffer = make([]float32, chunkBufferLength)
@@ -110,6 +159,20 @@ func extractFeatures(d *wav.Decoder) (stats wavstats, err error) {
 	return stats, err
 }
 
+func getNormalizedPcm(bitDepth uint16, pcmValue int) float32 {
+	if bitDepth == 16 {
+		raw := int64(int32(int16(pcmValue)))
+		return normalize(raw, -32768, 32767)
+	} else if bitDepth == 24 {
+		raw := int64(int32(pcmValue))
+		return normalize(raw, -8388608, 8388607)
+	} else if bitDepth == 32 {
+		raw := int64(int32(pcmValue))
+		return normalize(raw, -2147483648, 2147483647)
+	}
+	return 0
+}
+
 func rootMeanSquare(data []float32) float64 {
 	sum := 0.
 	n := float64(len(data))
@@ -117,139 +180,4 @@ func rootMeanSquare(data []float32) float64 {
 		sum += float64(x * x)
 	}
 	return math.Sqrt(sum / n)
-}
-
-func treeClassify() {
-	var tree base.Classifier
-
-	rand.Seed(44111342)
-
-	// Load in the iris dataset
-	iris, err := base.ParseCSVToInstances("datasets/iris_headers.csv", true)
-	if err != nil {
-		panic(err)
-	}
-
-	// Discretise the iris dataset with Chi-Merge
-	filt := filters.NewChiMergeFilter(iris, 0.999)
-	for _, a := range base.NonClassFloatAttributes(iris) {
-		filt.AddAttribute(a)
-	}
-	filt.Train()
-	irisf := base.NewLazilyFilteredInstances(iris, filt)
-
-	// Create a 60-40 training-test split
-	trainData, testData := base.InstancesTrainTestSplit(irisf, 0.60)
-
-	//
-	// First up, use ID3
-	//
-	tree = trees.NewID3DecisionTree(0.6)
-	// (Parameter controls train-prune split.)
-
-	// Train the ID3 tree
-	err = tree.Fit(trainData)
-	if err != nil {
-		panic(err)
-	}
-
-	// Generate predictions
-	predictions, err := tree.Predict(testData)
-	if err != nil {
-		panic(err)
-	}
-
-	// Evaluate
-	fmt.Println("ID3 Performance (information gain)")
-	cf, err := evaluation.GetConfusionMatrix(testData, predictions)
-	if err != nil {
-		panic(fmt.Sprintf("Unable to get confusion matrix: %s", err.Error()))
-	}
-	fmt.Println(evaluation.GetSummary(cf))
-
-	tree = trees.NewID3DecisionTreeFromRule(0.6, new(trees.InformationGainRatioRuleGenerator))
-	// (Parameter controls train-prune split.)
-
-	// Train the ID3 tree
-	err = tree.Fit(trainData)
-	if err != nil {
-		panic(err)
-	}
-
-	// Generate predictions
-	predictions, err = tree.Predict(testData)
-	if err != nil {
-		panic(err)
-	}
-
-	// Evaluate
-	fmt.Println("ID3 Performance (information gain ratio)")
-	cf, err = evaluation.GetConfusionMatrix(testData, predictions)
-	if err != nil {
-		panic(fmt.Sprintf("Unable to get confusion matrix: %s", err.Error()))
-	}
-	fmt.Println(evaluation.GetSummary(cf))
-
-	tree = trees.NewID3DecisionTreeFromRule(0.6, new(trees.GiniCoefficientRuleGenerator))
-	// (Parameter controls train-prune split.)
-
-	// Train the ID3 tree
-	err = tree.Fit(trainData)
-	if err != nil {
-		panic(err)
-	}
-
-	// Generate predictions
-	predictions, err = tree.Predict(testData)
-	if err != nil {
-		panic(err)
-	}
-
-	// Evaluate
-	fmt.Println("ID3 Performance (gini index generator)")
-	cf, err = evaluation.GetConfusionMatrix(testData, predictions)
-	if err != nil {
-		panic(fmt.Sprintf("Unable to get confusion matrix: %s", err.Error()))
-	}
-	fmt.Println(evaluation.GetSummary(cf))
-	//
-	// Next up, Random Trees
-	//
-
-	// Consider two randomly-chosen attributes
-	tree = trees.NewRandomTree(2)
-	err = tree.Fit(trainData)
-	if err != nil {
-		panic(err)
-	}
-	predictions, err = tree.Predict(testData)
-	if err != nil {
-		panic(err)
-	}
-	fmt.Println("RandomTree Performance")
-	cf, err = evaluation.GetConfusionMatrix(testData, predictions)
-	if err != nil {
-		panic(fmt.Sprintf("Unable to get confusion matrix: %s", err.Error()))
-	}
-	fmt.Println(evaluation.GetSummary(cf))
-
-	//
-	// Finally, Random Forests
-	//
-	tree = ensemble.NewRandomForest(70, 3)
-	err = tree.Fit(trainData)
-	if err != nil {
-		panic(err)
-	}
-	predictions, err = tree.Predict(testData)
-	if err != nil {
-		panic(err)
-	}
-	fmt.Println("RandomForest Performance")
-	cf, err = evaluation.GetConfusionMatrix(testData, predictions)
-	if err != nil {
-		panic(fmt.Sprintf("Unable to get confusion matrix: %s", err.Error()))
-	}
-	fmt.Println(evaluation.GetSummary(cf))
-
 }
